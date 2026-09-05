@@ -45,6 +45,10 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
 #landing .row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
 #landing .foot{font-family:var(--mono);font-size:10px;color:var(--ink3);letter-spacing:.12em}
 #landing .foot abbr{border-bottom:1px dotted var(--ink3);cursor:help}
+#landing .liveAlt{font-size:12px;color:var(--ink3)}
+#landing .liveAlt .linkbtn{color:var(--ink2);border-bottom:1px dotted var(--ink3);
+  font-family:var(--mono);font-size:10px;letter-spacing:.08em;padding:2px 0}
+#landing .liveAlt .linkbtn:hover{color:var(--amber);border-color:var(--amber)}
 
 #app{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:14px;padding:16px;
   max-width:1180px;width:100%;margin:0 auto}
@@ -155,7 +159,7 @@ details.adv[open] summary{color:var(--amber);margin-bottom:12px}
 #liveLevel{height:3px;background:var(--line);margin-bottom:14px}
 #liveLevel i{display:block;height:100%;background:var(--amber);width:0}
 #liveCircle{display:block;margin:0 auto}
-#liveFoot{font-family:var(--mono);font-size:9.5px;color:var(--ink3);letter-spacing:.06em;margin-top:14px;line-height:1.7}
+#liveFoot{font-family:var(--mono);font-size:9.5px;color:var(--ink3);letter-spacing:.06em;margin-top:14px;line-height:1.7;min-height:28px}
 
 #toasts{position:fixed;left:16px;bottom:16px;z-index:70;display:flex;flex-direction:column;gap:8px}
 .toast{background:var(--panel);border:1px solid var(--line2);border-left:3px solid var(--amber);
@@ -180,26 +184,27 @@ details.adv[open] summary{color:var(--amber);margin-bottom:12px}
   <div class="brand">CHORDLAB</div>
   <div class="file" id="fileName"></div>
   <div class="acts">
-    <button class="btn" id="btnLive" aria-label="Live microphone analysis">Live</button>
     <button class="btn" id="btnDetails" disabled aria-label="Chord details">Details</button>
     <button class="btn" id="btnExport" disabled>Export</button>
     <button class="btn" id="btnSettings" aria-label="Settings">Settings</button>
+    <button class="btn" id="btnLive" aria-label="Live microphone analysis">Live mic</button>
   </div>
 </header>
 
+<!-- START SCREEN: file drop is the one and only primary flow -->
 <section id="landing">
   <h1>CHORDLAB</h1>
   <div class="sub">Find the chords in any song.</div>
   <div id="drop" role="button" tabindex="0" aria-label="Drop an audio or video file">
     <div class="d1">Drop an audio or video file here</div>
-    <div class="d2">or click to choose</div>
+    <div class="d2">or click to choose — analysis starts automatically</div>
   </div>
   <div class="row">
     <button class="btn primary" id="btnBrowse">Choose file</button>
     <button class="btn" id="btnDemo">Try synthetic demo</button>
-    <button class="btn" id="btnLiveLanding">Live microphone</button>
   </div>
   <div class="foot">Local processing · No AI · No uploads · <abbr title="MP3, WAV, FLAC, OGG, M4A, AAC, MP4, WebM, MOV — depending on your browser's decoders">supported formats</abbr></div>
+  <div class="liveAlt">Have a microphone? <button id="btnLiveLanding" class="linkbtn">use live input instead</button></div>
 </section>
 
 <section id="app" hidden>
@@ -337,6 +342,9 @@ SPACE play/pause · ← → seek (SHIFT fine) · HOME/END · R re-analyze · E e
      The time-domain frame copy for the bass autocorrelation path is taken
      BEFORE the FFT runs — FFT output arrays are never reused as audio.
      All tunables live in CFG with comments explaining their purpose.
+     Live path hardening: NaN-phase guard + buffer cap in the stream
+     resampler, sample-rate validation on liveStart, candidate preview in
+     live messages, and a faster first-chord lock (2 frames, then 4).
 ==================================================================== -->
 <script type="text/plain" id="engine-src">
 'use strict';
@@ -406,13 +414,18 @@ function resample(x,srIn,srOut){
   }
   return y;
 }
+/* Stateful variant for live chunks. Guards: a NaN/negative phase would stall
+   output forever (the "stuck at listening" failure mode), so it is reset;
+   the input buffer is capped so a stall can never grow memory. */
 function makeStreamResampler(srIn,srOut){
-  const ratio=srOut/srIn,T=sincKernel(.92*.5*Math.min(1,ratio));
+  const ratio=srOut/srIn;
+  const T=sincKernel(.92*.5*Math.min(1,ratio));
   const half=RES.taps/2,sub=RES.sub;
   let buf=[],phase=0;
   return{push(chunk){
     const out=[];
     for(let i=0;i<chunk.length;i++)buf.push(chunk[i]);
+    if(!isFinite(phase)||phase<0)phase=0;
     while(phase+half<buf.length){
       const t=phase;
       let acc=0;
@@ -425,6 +438,10 @@ function makeStreamResampler(srIn,srOut){
       }
       out.push(acc);
       phase+=1/ratio;
+    }
+    if(buf.length>65536){
+      buf=buf.slice(buf.length-4096);
+      phase=Math.min(phase,4095);
     }
     const keep=Math.max(0,Math.floor(phase-half-1));
     if(keep>0){buf=buf.slice(keep);phase-=keep;}
@@ -817,7 +834,7 @@ function scoreCandidates(c,low,bp,bc,out){
   }
 }
 
-/* ===== Module: TemporalDecoder — factored Viterbi over 336 chords + Unknown ===== */
+/* ===== Module: TemporalDecoder — factored Viterbi over chords + Unknown ===== */
 function decode(E,B){
   const V=new Float64Array(S),Vn=new Float64Array(S);
   const bp=new Uint16Array(S*B);
@@ -1404,7 +1421,7 @@ function computeAll(x,sr,opts,onProg,gen){
     strictness:opts.strictness,pass1Ms:t1-t0,pass2Ms:Date.now()-t1,
     segments:res.segments.length,ambiguous:amb,
     avgConf:res.segments.length?csum/res.segments.length:0,
-    bassCoverage:F?bassN/F:0,engine:'2.1'};
+    bassCoverage:F?bassN/F:0,engine:'2.2'};
   return{segments:res.segments,meta,features};
 }
 function computeAllSync(x,sr,opts){
@@ -1450,16 +1467,17 @@ self.onmessage=async e=>{
         preset:m.options.preset,source:m.options.source,strictness:m.options.strictness,
         pass1Ms:0,pass2Ms:Date.now(),segments:res.segments.length,ambiguous:amb,
         avgConf:res.segments.length?csum/res.segments.length:0,
-        bassCoverage:fr.length?bassN/fr.length:0,engine:'2.1'};
+        bassCoverage:fr.length?bassN/fr.length:0,engine:'2.2'};
       post({type:'result',segments:res.segments,meta});
     }else if(m.cmd==='makeDemo'){
       post({type:'demoAudio',samples:buildDemo(),sr:44100});
     }else if(m.cmd==='selftest'){
       post({type:'selftest',report:runSelfTest()});
     }else if(m.cmd==='liveStart'){
+      const srIn=(typeof m.sr==='number'&&isFinite(m.sr)&&m.sr>=8000&&m.sr<=192000)?m.sr:48000;
       const P={fft:2048,hop:512,partials:6,acf:false};
       ST.live={eng:new FrameEngine(CFG.sr,P,'full',440),
-        res:makeStreamResampler(m.sr,CFG.sr),
+        res:makeStreamResampler(srIn,CFG.sr),
         acc:new Float32Array(8192),len:0,read:0,
         cur:-1,cand:-1,streak:0,lowStreak:0,confEma:0,state:'LISTENING',
         sc:new Float32Array(NQ)};
@@ -1475,7 +1493,10 @@ self.onmessage=async e=>{
   }
 };
 
-/* ===== Module: live state machine (LISTENING→CANDIDATE→CONFIRMED, hysteresis) ===== */
+/* ===== Module: live state machine (LISTENING→CANDIDATE→CONFIRMED, hysteresis).
+   First lock needs 2 consistent frames (fast display); later changes need 4
+   (stability). Unconfirmed candidates are sent along so the UI can show a
+   live preview without letting flicker reach the confirmed chord. ===== */
 function liveFrame(m){
   const L=ST.live;
   if(!L)return;
@@ -1497,8 +1518,8 @@ function liveFrame(m){
     const o=L.eng.analyzeFrame(L.acc,L.read);
     L.read+=hop;
     if(o.silent){
-      L.cur=-1;L.cand=-1;L.state='NO SIGNAL';
-      post({type:'live',stamp:m.stamp,chord:null,chroma:null,state:L.state});
+      L.cur=-1;L.cand=-1;L.streak=0;L.state='NO SIGNAL';
+      post({type:'live',stamp:m.stamp,chord:null,cand:null,chroma:null,state:L.state});
       posted=true;
       continue;
     }
@@ -1509,7 +1530,8 @@ function liveFrame(m){
     if(bi===L.cur){L.streak=0;L.lowStreak=0;L.state='CONFIRMED';}
     else if(bi===L.cand)L.streak++;
     else{L.cand=bi;L.streak=1;}
-    if(L.cand!==L.cur&&L.cand>=0&&L.streak>=4&&conf>=.42){
+    const need=L.cur>=0?4:2;
+    if(L.cand!==L.cur&&L.cand>=0&&L.streak>=need&&conf>=.42){
       L.cur=L.cand;L.streak=0;L.state='CONFIRMED';
     }else if(L.cand!==L.cur&&L.streak>=1){
       L.state=L.cur>=0?'TRANSITIONING':'CANDIDATE';
@@ -1518,9 +1540,11 @@ function liveFrame(m){
     if(L.cur>=0&&L.confEma<.22){L.lowStreak++;if(L.lowStreak>9)L.state='AMBIGUOUS';}
     else L.lowStreak=0;
     const st=STATES[L.cur>=0?L.cur:0];
+    const cs=(L.cand>=0&&L.cand!==L.cur)?STATES[L.cand]:null;
     post({type:'live',stamp:m.stamp,
       chord:L.cur>=0?{root:st.root,quality:st.qid,conf:clamp01(L.confEma),
         bassPc:o.bassPc,bassMidi:o.bassMidi}:null,
+      cand:cs?{root:cs.root,quality:cs.qid,conf}:null,
       chroma:Float32Array.from(o.chroma),state:L.state,rms:o.rms});
     posted=true;
   }
@@ -1528,7 +1552,7 @@ function liveFrame(m){
     L.acc.copyWithin(0,L.read,L.len);
     L.len-=L.read;L.read=0;
   }
-  if(!posted)post({type:'live',stamp:m.stamp,chord:null,chroma:null,state:L.state,keep:true});
+  if(!posted)post({type:'live',stamp:m.stamp,chord:null,cand:null,chroma:null,state:L.state,keep:true});
 }
 
 /* ===== Module: synthetic signal generator (deterministic, seeded LCG) ===== */
@@ -1866,9 +1890,11 @@ function decode(ctx,ab){
     }catch(e){rej(e);}
   });
 }
+/* Created/resumed as early as possible; the resume promise is fire-and-forget
+   so callers inside click handlers keep the user gesture intact. */
 function ensureCtx(){
   if(!S.ctx)S.ctx=new(window.AudioContext||window.webkitAudioContext)();
-  if(S.ctx.state==='suspended')S.ctx.resume();
+  if(S.ctx.state==='suspended')S.ctx.resume().catch(()=>{});
   return S.ctx;
 }
 function computePeaks(x,buckets){
@@ -2591,55 +2617,173 @@ function renderDiagnostics(m){
     'Preset: '+m.preset+' · source: '+m.source;
 }
 
-/* ---- live microphone ---- */
+/* ---- live microphone (secondary feature; gesture-safe, watchdogs, fallback) ---- */
  $('btnLive').onclick=$('btnLiveLanding').onclick=toggleLive;
  $('btnLiveStop').onclick=stopLive;
+let liveFootAt=0;
+
 async function toggleLive(){
   if(S.live){stopLive();return;}
   if(S.analyzing){toast('Wait for the analysis to finish before starting live mode.','err');return;}
   if(!S.worker){toast('The analysis engine is unavailable.','err');return;}
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    toast('This browser does not support microphone access.','err');return;
+  }
+  /* gesture-safe: create + resume the context synchronously, before any await */
+  const ctx=ensureCtx();
+  ctx.resume().catch(()=>{});
   let stream;
   try{
     stream=await navigator.mediaDevices.getUserMedia({audio:{
       echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
   }catch(err){
-    toast('Microphone unavailable — permission denied or no input device.','err');
+    const name=err&&err.name;
+    toast(name==='NotAllowedError'
+      ?'Microphone permission was denied — allow it in the browser and try again.'
+      :name==='NotFoundError'?'No microphone was found on this device.'
+      :'Microphone unavailable ('+(name||'unknown error')+').','err');
     return;
   }
-  const ctx=ensureCtx();
+  try{await ctx.resume();}catch(e){}
   const src=ctx.createMediaStreamSource(stream);
+  const an=ctx.createAnalyser();
+  an.fftSize=2048;
+  src.connect(an);                     // fallback capture + silence detection
   const sp=ctx.createScriptProcessor(2048,1,1);
   const sink=ctx.createGain();
   sink.gain.value=0;
   src.connect(sp);sp.connect(sink);sink.connect(ctx.destination);
   S.worker.postMessage({cmd:'liveStart',sr:ctx.sampleRate});
-  S.live={stream,src,sp,sink,latEma:null};
+  const L={stream,src,an,sp,sink,ctx,latEma:null,cb:0,frameMsgs:0,rmsEma:null,
+    path:'script-processor',timers:[],lastChord:null,reinits:0,
+    resumeClick:null,stateHandler:null};
+  S.live=L;
   $('liveOverlay').hidden=false;
   $('liveChord').innerHTML='<span style="color:var(--ink3)">listening…</span>';
-  $('liveFoot').textContent='Deterministic engine · state machine with hysteresis keeps the display stable.';
-  sp.onaudioprocess=e=>{
+  $('liveConf').textContent='—';
+  $('liveBass').textContent='—';
+  $('liveState').textContent=ctx.state==='running'?'LISTENING':'AUDIO PAUSED';
+  $('liveLevel').querySelector('i').style.width='0%';
+  /* click anywhere to recover a context suspended by the browser */
+  L.resumeClick=()=>{if(S.live&&S.live.ctx.state==='suspended')S.live.ctx.resume().catch(()=>{});};
+  document.addEventListener('click',L.resumeClick);
+  L.stateHandler=()=>{
     if(!S.live)return;
-    const chunk=new Float32Array(e.inputBuffer.getChannelData(0));
+    if(S.live.ctx.state!=='running'&&S.live.frameMsgs===0)
+      $('liveState').textContent='AUDIO PAUSED';
+  };
+  ctx.onstatechange=L.stateHandler;
+  sp.onaudioprocess=e=>{
+    const LL=S.live;
+    if(!LL||LL.path!=='script-processor')return;
+    LL.cb++;
+    const data=e.inputBuffer.getChannelData(0);
+    /* immediate level feedback straight from the capture path — independent
+       of the engine, so "is audio arriving" is always visible */
+    let s=0;
+    for(let i=0;i<data.length;i+=8)s+=data[i]*data[i];
+    setLiveLevel(Math.sqrt(s/(data.length/8)));
+    const chunk=new Float32Array(data);
     S.worker.postMessage({cmd:'liveFrame',chunk,stamp:performance.now()},[chunk.buffer]);
   };
+  /* watchdog 1: no audio callbacks after 1.2 s → retry resume */
+  L.timers.push(setTimeout(()=>{
+    if(!S.live||S.live.cb>0)return;
+    ctx.resume().catch(()=>{});
+    setLiveFootNow('No audio arriving yet — retrying audio…');
+  },1200));
+  /* watchdog 2: still nothing after 2.6 s → AnalyserNode fallback capture */
+  L.timers.push(setTimeout(()=>{
+    if(!S.live||S.live.cb>0)return;
+    startAnalyserFallback();
+  },2600));
+  /* watchdog 3: audio arrives but the engine produces no frames → re-init */
+  L.timers.push(setInterval(()=>{
+    const LL=S.live;
+    if(!LL||LL.cb===0||LL.frameMsgs>0)return;
+    LL.reinits++;
+    S.worker.postMessage({cmd:'liveStart',sr:LL.ctx.sampleRate});
+    if(LL.reinits===2)setLiveFootNow('Restarting the live engine…');
+    if(LL.reinits>=3)toast('The live engine is not responding to audio. Press Stop and try Live again.','err');
+  },3000));
+  updateLiveFoot();
+}
+function startAnalyserFallback(){
+  const L=S.live;
+  if(!L)return;
+  L.path='analyser';
+  try{L.sp.onaudioprocess=null;L.sp.disconnect();}catch(e){}
+  $('liveState').textContent='LISTENING';
+  setLiveFootNow('Primary capture unavailable in this browser — using fallback capture');
+  L.timers.push(setInterval(()=>{
+    const LL=S.live;
+    if(!LL||LL.path!=='analyser')return;
+    const buf=new Float32Array(2048);
+    if(LL.an.getFloatTimeDomainData)LL.an.getFloatTimeDomainData(buf);
+    else{
+      const b=new Uint8Array(buf.length);
+      LL.an.getByteTimeDomainData(b);
+      for(let i=0;i<buf.length;i++)buf[i]=(b[i]-128)/128;
+    }
+    let s=0;
+    for(let i=0;i<buf.length;i+=8)s+=buf[i]*buf[i];
+    setLiveLevel(Math.sqrt(s/256));
+    S.worker.postMessage({cmd:'liveFrame',chunk:buf,stamp:performance.now()},[buf.buffer]);
+  },45));
+}
+function setLiveLevel(rms){
+  const L=S.live;
+  if(!L)return;
+  L.rmsEma=L.rmsEma==null?rms:.8*L.rmsEma+.2*rms;
+  const lv=clamp(1+20*Math.log10(L.rmsEma+1e-6)/60,0,1);
+  $('liveLevel').querySelector('i').style.width=(lv*100)+'%';
+}
+function setLiveFootNow(text){$('liveFoot').textContent=text;}
+function updateLiveFoot(m){
+  const L=S.live;
+  if(!L)return;
+  const parts=[];
+  parts.push('audio '+(L.cb>0?'ok ('+L.cb+' buffers)':(L.path==='analyser'?'fallback':'none')));
+  parts.push('engine '+(L.frameMsgs>0?'ok ('+L.frameMsgs+' frames)':'waiting'));
+  if(m&&m.cand){
+    const names=spelling();
+    const qi=QINFO[m.cand.quality]?m.cand.quality:'maj';
+    parts.push('candidate '+names[m.cand.root]+(QINFO[qi].s||'')+' '+Math.round((m.cand.conf||0)*100)+'%');
+  }
+  const reaction=Math.round((2048+2*512)/12000*1000);
+  if(L.latEma!=null)parts.push('round-trip ≈ '+Math.max(reaction,Math.round(L.latEma))+' ms');
+  parts.push('deterministic · no AI');
+  $('liveFoot').textContent=parts.join(' · ');
 }
 function stopLive(){
-  if(!S.live)return;
   const L=S.live;
+  if(!L)return;
+  S.live=null;                 // all handlers check this first
+  for(const t of L.timers){clearTimeout(t);clearInterval(t);}
   try{
-    L.sp.onaudioprocess=null;
-    L.sp.disconnect();L.src.disconnect();L.sink.disconnect();
-    L.stream.getTracks().forEach(t=>t.stop());
+    if(L.sp)L.sp.onaudioprocess=null;
+    if(L.resumeClick)document.removeEventListener('click',L.resumeClick);
+    if(L.ctx&&L.ctx.onstatechange===L.stateHandler)L.ctx.onstatechange=null;
+    [L.sp,L.an,L.sink,L.src].forEach(n=>{if(n){try{n.disconnect();}catch(e){}}});
+    if(L.stream)L.stream.getTracks().forEach(t=>t.stop());
   }catch(e){}
-  S.live=null;
   S.worker.postMessage({cmd:'liveStop'});
   $('liveOverlay').hidden=true;
+  /* if no file was loaded, return to the drop-audio start screen */
+  if(!S.source.type){
+    $('landing').hidden=false;
+    $('app').hidden=true;
+    const b=$('btnBrowse');
+    if(b&&b.focus)b.focus();
+  }
 }
 function liveUpdate(m){
-  if(!S.live)return;
+  const L=S.live;
+  if(!L)return;
+  if(!m.keep)L.frameMsgs++;
   if(m.stamp){
     const lat=performance.now()-m.stamp;
-    S.live.latEma=S.live.latEma==null?lat:.85*S.live.latEma+.15*lat;
+    L.latEma=L.latEma==null?lat:.85*L.latEma+.15*lat;
   }
   $('liveState').textContent=m.state||'';
   if(m.chord){
@@ -2652,20 +2796,19 @@ function liveUpdate(m){
     $('liveBass').textContent=m.chord.bassMidi>=0?midiName(m.chord.bassMidi,names):'—';
     drawCircle($('liveCircle'),m.chroma,{root:m.chord.root,quality:m.chord.quality,
       bassPc:m.chord.bassPc,ambiguous:false,silent:false});
-    /* reaction time derived from real parameters: 2048-sample window + 4 confirmation hops at 12 kHz */
-    const reaction=Math.round((2048/2+4*512)/12000*1000);
-    $('liveFoot').textContent='Reaction ≈ '+reaction+' ms (window + confirmation frames)'+
-      (S.live.latEma!=null?' · measured UI round-trip ≈ '+Math.round(S.live.latEma)+' ms':'')+
-      ' · deterministic analysis, no AI.';
+    L.lastChord=true;
   }else if(m.state==='NO SIGNAL'){
     $('liveChord').innerHTML='<span style="color:var(--ink3)">—</span>';
     $('liveConf').textContent='—';
     $('liveBass').textContent='—';
+    L.lastChord=null;
+  }else if(!L.lastChord){
+    /* frames are arriving but nothing confirmed yet — prove the pipeline is alive */
+    $('liveChord').innerHTML='<span style="color:var(--ink3)">detecting…</span>';
   }
-  if(m.rms!=null){
-    const lv=clamp(1+20*Math.log10(m.rms+1e-6)/60,0,1);
-    $('liveLevel').querySelector('i').style.width=(lv*100)+'%';
-  }
+  if(m.rms!=null)setLiveLevel(m.rms);
+  const now=performance.now();
+  if(now-liveFootAt>500){liveFootAt=now;updateLiveFoot(m);}
 }
 
 /* ---- demo ---- */
@@ -2736,7 +2879,7 @@ window.addEventListener('keydown',e=>{
   }
 });
 
-/* ---- resize / boot ---- */
+/* ---- resize / boot: always start on the drop-audio screen ---- */
 const ro=new ResizeObserver(()=>{
   fitCanvas(tlc);
   if(TL.fit&&S.duration)tlFit();
@@ -2744,6 +2887,19 @@ const ro=new ResizeObserver(()=>{
   updateChordNow(true);
 });
 ro.observe(tlc);
+/* hard reset of the start state: landing visible, app and live hidden,
+   drop zone focused so Enter immediately opens the file picker */
+function resetToStart(){
+  $('liveOverlay').hidden=true;
+  $('app').hidden=true;
+  $('landing').hidden=false;
+  $('fileName').textContent='';
+  $('btnDetails').disabled=true;
+  $('btnExport').disabled=true;
+  const d=$('drop');
+  if(d&&d.focus)d.focus();
+}
+resetToStart();
 S.worker=buildWorker();
 fitCanvas(tlc);
 requestAnimationFrame(loop);
