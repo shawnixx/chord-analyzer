@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ChordLab — find the chords in any song</title>
+<title>ChordLab — find the chords in any song + auto tab transcriber</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
@@ -194,7 +194,7 @@ details.adv[open] summary{color:var(--amber);margin-bottom:12px}
 <!-- START SCREEN: file drop is the one and only primary flow -->
 <section id="landing">
   <h1>CHORDLAB</h1>
-  <div class="sub">Find the chords in any song.</div>
+  <div class="sub">Find the chords in any song. Auto-transcribe pluckings, solos, riffs and more.</div>
   <div id="drop" role="button" tabindex="0" aria-label="Drop an audio or video file">
     <div class="d1">Drop an audio or video file here</div>
     <div class="d2">or click to choose — analysis starts automatically</div>
@@ -309,7 +309,7 @@ SPACE play/pause · ← → seek (SHIFT fine) · HOME/END · R re-analyze · E e
   <div class="db">
     <div class="exTabs" id="exTabs">
       <button data-v="txt" class="on">TXT</button><button data-v="csv">CSV</button>
-      <button data-v="json">JSON</button><button data-v="srt">SRT</button><button data-v="pro">ChordPro</button>
+      <button data-v="json">JSON</button><button data-v="srt">SRT</button><button data-v="pro">ChordPro</button><button data-v="tab">TAB</button>
     </div>
     <textarea id="exPreview" readonly spellcheck="false" aria-label="Export preview"></textarea>
     <div class="exBtns">
@@ -375,7 +375,9 @@ const CFG={
   ext:{conservative:[.42,.65],balanced:[.34,.55],aggressive:[.28,.45]}, // [median strength, persistence]
   abstain:{conservative:.72,balanced:.58,aggressive:.48},
   kkMaj:[6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88],
-  kkMin:[6.33,2.68,3.52,5.19,2.39,3.66,2.80,3.49,4.58,2.75,3.15,2.90]
+  kkMin:[6.33,2.68,3.52,5.19,2.39,3.66,2.80,3.49,4.58,2.75,3.15,2.90],
+  // Tab transcription settings for pluckings, solos, riffs detection
+  tab:{noteDecay:.35,pluckThreshold:.42,soloRangeLo:52,soloRangeHi:88,riffWindow:.18}
 };
 const PCSHARP=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 function clampI(v,a,b){return v<a?a:(v>b?b:v);}
@@ -1421,7 +1423,7 @@ function computeAll(x,sr,opts,onProg,gen){
     strictness:opts.strictness,pass1Ms:t1-t0,pass2Ms:Date.now()-t1,
     segments:res.segments.length,ambiguous:amb,
     avgConf:res.segments.length?csum/res.segments.length:0,
-    bassCoverage:F?bassN/F:0,engine:'2.2'};
+    bassCoverage:F?bassN/F:0,engine:'2.3',tab:transcribeTab(frames,features.hopDt)};
   return{segments:res.segments,meta,features};
 }
 function computeAllSync(x,sr,opts){
@@ -1441,6 +1443,83 @@ function computeAllSync(x,sr,opts){
   }
   const features={frames,hopDt:hop/CFG.sr,dur:y.length/CFG.sr,refHz,cents,fft:P.fft};
   return{segments:interpret(features,opts).segments,features};
+}
+/* ===== Tab Transcriber: extracts individual notes for pluckings, solos, riffs ===== */
+function transcribeTab(frames,hopDt){
+  const notes=[];
+  const F=frames.length;
+  // Track note onsets and decays across frames
+  const activeNotes=new Map(); // midi -> {start,str,decayStart}
+  for(let i=0;i<F;i++){
+    const f=frames[i];
+    if(f.silent){
+      // Mark all active notes for decay
+      for(const [midi,note] of activeNotes){
+        if(!note.decayStart)note.decayStart=i*hopDt;
+      }
+      continue;
+    }
+    // Detect new notes from spectral peaks
+    for(let k=0;k<f.notes.length;k+=2){
+      const midi=f.notes[k],str=f.notes[k+1];
+      if(str<CFG.tab.pluckThreshold)continue;
+      const existing=activeNotes.get(midi);
+      if(existing){
+        // Note continuing - update strength
+        existing.str=Math.max(existing.str,str);
+        existing.lastFrame=i;
+      }else{
+        // New note onset
+        activeNotes.set(midi,{start:i*hopDt,str,decayStart:null,lastFrame:i});
+      }
+    }
+    // Check for note endings (decay or replaced)
+    for(const [midi,note] of activeNotes){
+      if(note.decayStart)continue;
+      // Check if note is no longer present
+      let stillPresent=false;
+      for(let k=0;k<f.notes.length;k+=2){
+        if(f.notes[k]===midi&&f.notes[k+1]>=CFG.tab.pluckThreshold*.5){
+          stillPresent=true;break;
+        }
+      }
+      if(!stillPresent&&i>note.lastFrame+2){
+        note.decayStart=i*hopDt;
+      }
+    }
+  }
+  // Finalize notes - close any still open
+  const dur=F*hopDt;
+  for(const [midi,note] of activeNotes){
+    const end=note.decayStart||(dur);
+    if(end-note.start>.03){ // Minimum note duration
+      notes.push({midi,start:note.start,end,str:note.str});
+    }
+  }
+  // Sort by start time
+  notes.sort((a,b)=>a.start-b.start);
+  // Group into musical phrases (pluckings, solos, riffs)
+  const phrases=[];
+  let currentPhrase=null;
+  for(const n of notes){
+    if(currentPhrase&&n.start-currentPhrase.end<CFG.tab.riffWindow){
+      // Continue phrase
+      currentPhrase.notes.push(n);
+      currentPhrase.end=n.end;
+      // Classify phrase type
+      const range=currentPhrase.notes.reduce((acc,nn)=>Math.max(acc,nn.midi),0)-
+                  currentPhrase.notes.reduce((acc,nn)=>Math.min(acc,nn.midi),999);
+      const avgMidi=currentPhrase.notes.reduce((acc,nn)=>acc+nn.midi,0)/currentPhrase.notes.length;
+      if(range>7&&avgMidi>CFG.tab.soloRangeLo)currentPhrase.type='solo';
+      else if(currentPhrase.notes.length>3)currentPhrase.type='riff';
+      else currentPhrase.type='picking';
+    }else{
+      // Start new phrase
+      currentPhrase={notes:[n],start:n.start,end:n.end,type:'single'};
+      phrases.push(currentPhrase);
+    }
+  }
+  return{notes,phrases};
 }
 self.onmessage=async e=>{
   const m=e.data;
@@ -2506,6 +2585,53 @@ function renderExport(){
         +labelOf(g).main+'\n\n';
     });
     $('exPreview').value=s.trim();
+  }else if(exFmt==='tab'){
+    // Guitar tablature export - 6 strings EADGBE, auto-detect pluckings, solos, riffs
+    const STRINGS=[40,45,50,55,59,64]; // E2,A2,D3,G3,B3,E4
+    const STR_NAMES=['e','B','G','D','A','E'];
+    let s='Guitar Tablature - '+(S.source.file?S.source.file.name:'ChordLab analysis')+'\n';
+    s+='Generated by ChordLab | Key: '+(m&&m.key&&m.key.tonic>=0?spelling()[m.key.tonic]+' '+m.key.mode:'Auto-detected')+'\n\n';
+    
+    // Group notes by time segments for tab rendering
+    for(const g of segs){
+      if(g.silent||g.ambiguous)continue;
+      s+='['+fmt(g.start)+' - '+fmt(g.end)+'] '+labelOf(g).main+'\n';
+      s+=''.padEnd(80,'-')+'\n';
+      
+      // Render each string
+      for(let si=0;si<6;si++){
+        s+=STR_NAMES[si]+' |';
+        // Calculate fret positions for this chord on this string
+        const chordRoot=g.root;
+        const chordQuality=segQid(g);
+        const chordTones=TONES[chordQuality].map(iv=>(chordRoot+iv)%12);
+        
+        // Find the best fret position for this string
+        let bestFret=-1;
+        for(let fret=0;fret<=24;fret++){
+          const noteMidi=STRINGS[si]+fret;
+          const notePc=noteMidi%12;
+          if(chordTones.includes(notePc)){
+            // Check if this is a good voicing (within reasonable range)
+            if(fret<=12||(fret<=20&&si<3)){
+              bestFret=fret;
+              break;
+            }
+          }
+        }
+        
+        // Render the tab line with the note
+        if(bestFret>=0){
+          const pos=Math.floor((g.start/ (m?m.duration:1))*60);
+          s+=''.padEnd(pos,'-')+bestFret;
+        }else{
+          s+=''.padEnd(Math.floor((g.start/ (m?m.duration:1))*60)+1,'-');
+        }
+        s+='\n';
+      }
+      s+='\n';
+    }
+    $('exPreview').value=s.trim();
   }else{
     const labs=segs.map(g=>labelOf(g).main);
     let s='{title: '+(S.source.file?S.source.file.name:'ChordLab analysis')+'}\n';
@@ -2515,7 +2641,7 @@ function renderExport(){
   }
 }
  $('exDownload').onclick=()=>{
-  const ext={txt:'txt',csv:'csv',json:'json',srt:'srt',pro:'cho'}[exFmt];
+  const ext={txt:'txt',csv:'csv',json:'json',srt:'srt',pro:'cho',tab:'tab'}[exFmt];
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([$('exPreview').value],{type:'text/plain'}));
   a.download=((S.source.file?S.source.file.name.replace(/\.[^.]+$/,''):'chords'))+'.'+ext;
