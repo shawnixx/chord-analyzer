@@ -376,8 +376,23 @@ const CFG={
   abstain:{conservative:.72,balanced:.58,aggressive:.48},
   kkMaj:[6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88],
   kkMin:[6.33,2.68,3.52,5.19,2.39,3.66,2.80,3.49,4.58,2.75,3.15,2.90],
-  // Tab transcription settings for pluckings, solos, riffs detection
-  tab:{noteDecay:.35,pluckThreshold:.42,soloRangeLo:52,soloRangeHi:88,riffWindow:.18}
+  // Tab transcription settings - v2.3 optimized for pluckings, solos, riffs detection
+  tab:{
+    noteDecay:.35,           // decay threshold for note ending detection
+    pluckThreshold:.38,      // lowered for better sensitivity to quiet pluckings
+    soloRangeLo:52,          // MIDI note threshold for solo detection (C3+)
+    soloRangeHi:88,          // upper bound for solo range
+    riffWindow:.20,          // time window for grouping notes into phrases (increased)
+    minNoteDur:.025,         // minimum note duration (25ms) - reduced for faster passages
+    strSmooth:.65,           // strength smoothing factor for continuous notes
+    phraseGap:.15,           // gap threshold for separating phrases
+    soloMinNotes:4,          // minimum notes for solo classification
+    riffMinNotes:3,          // minimum notes for riff classification
+    pickingMaxNotes:3,       // max notes for picking pattern
+    bendTolerance:1,         // semitone tolerance for bend detection
+    vibratoRate:5.5,         // Hz threshold for vibrato detection
+    harmonicThreshold:.55    // threshold for natural/artificial harmonic detection
+  }
 };
 const PCSHARP=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 function clampI(v,a,b){return v<a?a:(v>b?b:v);}
@@ -1444,81 +1459,182 @@ function computeAllSync(x,sr,opts){
   const features={frames,hopDt:hop/CFG.sr,dur:y.length/CFG.sr,refHz,cents,fft:P.fft};
   return{segments:interpret(features,opts).segments,features};
 }
-/* ===== Tab Transcriber: extracts individual notes for pluckings, solos, riffs ===== */
+/* ===== Tab Transcriber v2.3: extracts individual notes for pluckings, solos, riffs with improved accuracy ===== */
 function transcribeTab(frames,hopDt){
   const notes=[];
   const F=frames.length;
-  // Track note onsets and decays across frames
-  const activeNotes=new Map(); // midi -> {start,str,decayStart}
+  if(F===0)return{notes:[],phrases:[]};
+  
+  // Track note onsets and decays across frames with enhanced detection
+  const activeNotes=new Map(); // midi -> {start,str,decayStart,lastFrame,strengths[]}
+  const noteHistory=new Map(); // midi -> recent strengths for smoothing
+  
   for(let i=0;i<F;i++){
     const f=frames[i];
+    const time=i*hopDt;
+    
     if(f.silent){
-      // Mark all active notes for decay
+      // Mark all active notes for decay with smoother transition
       for(const [midi,note] of activeNotes){
-        if(!note.decayStart)note.decayStart=i*hopDt;
+        if(!note.decayStart){
+          note.decayStart=time;
+          note.decayFrame=i;
+        }
       }
       continue;
     }
-    // Detect new notes from spectral peaks
+    
+    // Detect new notes from spectral peaks with improved sensitivity
+    const currentMidiSet=new Set();
     for(let k=0;k<f.notes.length;k+=2){
       const midi=f.notes[k],str=f.notes[k+1];
       if(str<CFG.tab.pluckThreshold)continue;
+      
+      currentMidiSet.add(midi);
       const existing=activeNotes.get(midi);
+      
       if(existing){
-        // Note continuing - update strength
-        existing.str=Math.max(existing.str,str);
+        // Note continuing - apply strength smoothing for vibrato/bend detection
+        const smoothedStr=existing.str*CFG.tab.strSmooth+str*(1-CFG.tab.strSmooth);
+        existing.str=smoothedStr;
         existing.lastFrame=i;
+        existing.strengths.push(str);
+        
+        // Keep only recent history for memory efficiency
+        if(existing.strengths.length>20)existing.strengths.shift();
       }else{
-        // New note onset
-        activeNotes.set(midi,{start:i*hopDt,str,decayStart:null,lastFrame:i});
+        // New note onset - check for harmonic content
+        const isHarmonic=str>CFG.tab.harmonicThreshold&&midi>70;
+        activeNotes.set(midi,{
+          start:time,
+          str:str,
+          decayStart:null,
+          lastFrame:i,
+          strengths:[str],
+          isHarmonic:isHarmonic,
+          onsetFrame:i
+        });
       }
     }
-    // Check for note endings (decay or replaced)
+    
+    // Check for note endings (decay or replaced) with improved timing
     for(const [midi,note] of activeNotes){
       if(note.decayStart)continue;
-      // Check if note is no longer present
-      let stillPresent=false;
-      for(let k=0;k<f.notes.length;k+=2){
-        if(f.notes[k]===midi&&f.notes[k+1]>=CFG.tab.pluckThreshold*.5){
-          stillPresent=true;break;
+      
+      // Check if note is no longer present in current frame
+      if(!currentMidiSet.has(midi)){
+        // Allow brief gaps before marking as ended (legato handling)
+        if(i>note.lastFrame+3){
+          note.decayStart=time;
+          note.decayFrame=i;
         }
       }
-      if(!stillPresent&&i>note.lastFrame+2){
-        note.decayStart=i*hopDt;
-      }
     }
   }
-  // Finalize notes - close any still open
+  
+  // Finalize notes - close any still open with proper duration calculation
   const dur=F*hopDt;
   for(const [midi,note] of activeNotes){
-    const end=note.decayStart||(dur);
-    if(end-note.start>.03){ // Minimum note duration
-      notes.push({midi,start:note.start,end,str:note.str});
+    const end=note.decayStart||dur;
+    const minDur=CFG.tab.minNoteDur;
+    
+    // Calculate average strength for more accurate velocity
+    const avgStr=note.strengths.length>0?
+      note.strengths.reduce((a,b)=>a+b,0)/note.strengths.length:note.str;
+    
+    if(end-note.start>=minDur){
+      // Detect vibrato from strength variations
+      let hasVibrato=false;
+      if(note.strengths.length>=8){
+        const mean=note.strengths.reduce((a,b)=>a+b,0)/note.strengths.length;
+        const variance=note.strengths.reduce((a,b)=>a+(b-mean)*(b-mean),0)/note.strengths.length;
+        const stdDev=Math.sqrt(variance);
+        // Vibrato typically shows periodic amplitude modulation
+        hasVibrato=stdDev>0.08&&stdDev<0.35;
+      }
+      
+      // Detect potential bends (gradual pitch change would need phase tracking)
+      const strengthTrend=note.strengths.length>=4?
+        (note.strengths[note.strengths.length-1]-note.strengths[0])/note.strengths.length:0;
+      
+      notes.push({
+        midi:midi,
+        start:note.start,
+        end:end,
+        str:avgStr,
+        isHarmonic:note.isHarmonic||false,
+        hasVibrato:hasVibrato,
+        bendIndicator:Math.abs(strengthTrend)>0.02?strengthTrend:0
+      });
     }
   }
+  
   // Sort by start time
   notes.sort((a,b)=>a.start-b.start);
-  // Group into musical phrases (pluckings, solos, riffs)
+  
+  // Group into musical phrases (pluckings, solos, riffs) with improved classification
   const phrases=[];
   let currentPhrase=null;
+  
   for(const n of notes){
-    if(currentPhrase&&n.start-currentPhrase.end<CFG.tab.riffWindow){
+    const gapThreshold=CFG.tab.phraseGap;
+    
+    if(currentPhrase&&n.start-currentPhrase.end<gapThreshold){
       // Continue phrase
       currentPhrase.notes.push(n);
       currentPhrase.end=n.end;
-      // Classify phrase type
-      const range=currentPhrase.notes.reduce((acc,nn)=>Math.max(acc,nn.midi),0)-
-                  currentPhrase.notes.reduce((acc,nn)=>Math.min(acc,nn.midi),999);
-      const avgMidi=currentPhrase.notes.reduce((acc,nn)=>acc+nn.midi,0)/currentPhrase.notes.length;
-      if(range>7&&avgMidi>CFG.tab.soloRangeLo)currentPhrase.type='solo';
-      else if(currentPhrase.notes.length>3)currentPhrase.type='riff';
-      else currentPhrase.type='picking';
+      
+      // Reclassify phrase based on accumulated characteristics
+      const noteCount=currentPhrase.notes.length;
+      const midiValues=currentPhrase.notes.map(nn=>nn.midi);
+      const range=Math.max(...midiValues)-Math.min(...midiValues);
+      const avgMidi=midiValues.reduce((a,b)=>a+b,0)/noteCount;
+      
+      // Enhanced phrase classification
+      const hasHighNotes=avgMidi>CFG.tab.soloRangeLo;
+      const hasWideRange=range>9;
+      const hasVibratoNotes=currentPhrase.notes.filter(nn=>nn.hasVibrato).length;
+      const hasHarmonics=currentPhrase.notes.filter(nn=>nn.isHarmonic).length;
+      
+      if(hasWideRange&&hasHighNotes&&(noteCount>=CFG.tab.soloMinNotes||hasVibratoNotes>0)){
+        currentPhrase.type='solo';
+        currentPhrase.style=hasVibratoNotes>1?'expressive':'fast';
+      }else if(hasHarmonics>0){
+        currentPhrase.type='harmonics';
+      }else if(noteCount>=CFG.tab.riffMinNotes&&range<=6){
+        currentPhrase.type='riff';
+        currentPhrase.style=range<3?'chromatic':'diatonic';
+      }else if(noteCount<=CFG.tab.pickingMaxNotes&&range<=5){
+        currentPhrase.type='picking';
+        currentPhrase.style=noteCount===1?'single':'arpeggio';
+      }else{
+        currentPhrase.type='phrase';
+      }
     }else{
       // Start new phrase
-      currentPhrase={notes:[n],start:n.start,end:n.end,type:'single'};
+      currentPhrase={
+        notes:[n],
+        start:n.start,
+        end:n.end,
+        type:'single',
+        style:n.isHarmonic?'harmonic':(n.hasVibrato?'sustained':'normal')
+      };
       phrases.push(currentPhrase);
     }
   }
+  
+  // Post-process: merge very short adjacent phrases of same type
+  for(let i=phrases.length-1;i>0;i--){
+    const prev=phrases[i-1],curr=phrases[i];
+    if(prev.type===curr.type&&
+       curr.start-prev.end<0.08&&
+       prev.notes.length+curr.notes.length<=12){
+      prev.notes.push(...curr.notes);
+      prev.end=curr.end;
+      phrases.splice(i,1);
+    }
+  }
+  
   return{notes,phrases};
 }
 self.onmessage=async e=>{
